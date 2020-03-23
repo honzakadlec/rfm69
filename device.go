@@ -7,7 +7,6 @@ import (
 	"time"
 
 	"github.com/davecheney/gpio"
-	"github.com/fulr/spidev"
 )
 
 const (
@@ -25,7 +24,7 @@ type OnReceiveHandler func(*Data)
 
 // Device RFM69 Device
 type Device struct {
-	spiDevice  *spidev.SPIDevice
+	spiDevice  *spiDevice
 	gpio       gpio.Pin
 	mode       byte
 	address    byte
@@ -50,7 +49,7 @@ func NewDevice(nodeID, networkID byte, isRfm69HW bool) (*Device, error) {
 		return nil, err
 	}
 
-	spi, err := spidev.NewSPIDevice(spiPath)
+	spi, err := newSPIDevice(spiPath)
 	if err != nil {
 		return nil, err
 	}
@@ -80,11 +79,12 @@ func NewDevice(nodeID, networkID byte, isRfm69HW bool) (*Device, error) {
 func (r *Device) Close() error {
 	r.quit <- true
 	<-r.quit
+
 	err := r.gpio.Close()
 	if err != nil {
 		return err
 	}
-	r.spiDevice.Close()
+	r.spiDevice.spiClose()
 	return err
 }
 
@@ -93,7 +93,7 @@ func (r *Device) writeReg(addr, data byte) error {
 	tx[0] = addr | 0x80
 	tx[1] = data
 	//log.Printf("write %x: %x", addr, data)
-	_, err := r.spiDevice.Xfer(tx)
+	_, err := r.spiDevice.spiXfer(tx)
 	if err != nil {
 		log.Println(err)
 	}
@@ -104,7 +104,7 @@ func (r *Device) readReg(addr byte) (byte, error) {
 	tx := make([]uint8, 2)
 	tx[0] = addr & 0x7f
 	tx[1] = 0
-	rx, err := r.spiDevice.Xfer(tx)
+	rx, err := r.spiDevice.spiXfer(tx)
 	if err != nil {
 		log.Println(err)
 	}
@@ -189,18 +189,25 @@ func (r *Device) waitForMode() error {
 			reg, err := r.readReg(REG_IRQFLAGS1)
 			if err != nil {
 				errChan <- err
-				break
+				return
 			}
 			if reg&RF_IRQFLAGS1_MODEREADY != 0 {
 				errChan <- nil
-				break
+				return
 			}
 		}
 	}()
-	time.AfterFunc(5*time.Second, func() {
-		errChan <- errors.New("timeout")
-	})
-	return <-errChan
+	//When timer did not execute, it will not be Garbage Collected!
+	waitDuration := 5 * time.Second
+	idleDelay := time.NewTimer(waitDuration)
+	defer idleDelay.Stop()
+
+	select {
+	case <-idleDelay.C:
+		return errors.New("timeout")
+	case err := <-errChan:
+		return err
+	}
 }
 
 // Encrypt sets the encryption key and enables AES encryption
@@ -211,7 +218,7 @@ func (r *Device) Encrypt(key []byte) error {
 		tx := make([]byte, 17)
 		tx[0] = REG_AESKEY1 | 0x80
 		copy(tx[1:], key)
-		if _, err := r.spiDevice.Xfer(tx); err != nil {
+		if _, err := r.spiDevice.spiXfer(tx); err != nil {
 			return err
 		}
 	}
@@ -391,7 +398,7 @@ func (r *Device) writeFifo(data *Data) error {
 		tx[4] = 0x80
 	}
 	copy(tx[5:], data.Data[:buffersize])
-	_, err := r.spiDevice.Xfer(tx)
+	_, err := r.spiDevice.spiXfer(tx)
 	return err
 }
 
@@ -402,9 +409,9 @@ func (r *Device) readFifo() (Data, error) {
 	if err != nil {
 		return data, err
 	}
-	tx := new([67]byte)
+	tx := new([70]byte)
 	tx[0] = REG_FIFO & 0x7f
-	rx, err := r.spiDevice.Xfer(tx[:3])
+	rx, err := r.spiDevice.spiXfer(tx[:3])
 	if err != nil {
 		return data, err
 	}
@@ -413,7 +420,7 @@ func (r *Device) readFifo() (Data, error) {
 	if length > 66 {
 		length = 66
 	}
-	rx, err = r.spiDevice.Xfer(tx[:length+3])
+	rx, err = r.spiDevice.spiXfer(tx[:length+3])
 	if err != nil {
 		return data, err
 	}
